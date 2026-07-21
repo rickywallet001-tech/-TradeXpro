@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { OAUTH_APP_ID } from "../context/AuthContext";
+import { OAUTH_APP_ID, useAuth } from "../context/AuthContext";
 import { X, Radio } from "lucide-react";
 
 const WS_URL = `wss://api.derivws.com/trading/v1/options/ws/public`;
@@ -28,6 +28,8 @@ interface ScanResult {
   unPct: number;
   score: number;
   tradeType: string;
+  contractType: "DIGITOVER" | "DIGITUNDER";
+  barrier: number;
 }
 
 export default function AIScanner() {
@@ -45,6 +47,105 @@ export default function AIScanner() {
   const wsRef = useRef<WebSocket | null>(null);
   const resultsRef = useRef<Record<string, number[]>>({});
   const pendingRef = useRef<Set<string>>(new Set());
+
+  // --- Trade execution (separate authenticated socket, per AuthContext's OTP pattern) ---
+  const { activeAccount } = useAuth();
+  const [stake, setStake] = useState("1");
+  const [duration, setDuration] = useState("1");
+  const [firingTrade, setFiringTrade] = useState(false);
+  const [tradeStatus, setTradeStatus] = useState<string | null>(null);
+  const [awaitingConfirm, setAwaitingConfirm] = useState(false);
+  const authWsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    return () => {
+      authWsRef.current?.close();
+    };
+  }, []);
+
+  const openAuthenticatedSocket = useCallback((): Promise<WebSocket> => {
+    return new Promise((resolve, reject) => {
+      if (authWsRef.current && authWsRef.current.readyState === WebSocket.OPEN) {
+        resolve(authWsRef.current);
+        return;
+      }
+      if (!activeAccount) {
+        reject(new Error("No active Deriv account — please log in"));
+        return;
+      }
+      fetch(
+        `https://api.derivws.com/trading/v1/options/accounts/${activeAccount.account}/otp`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${activeAccount.token}`,
+            "Deriv-App-ID": OAUTH_APP_ID,
+          },
+        }
+      )
+        .then((res) => {
+          if (!res.ok) throw new Error(`OTP request failed (${res.status})`);
+          return res.json();
+        })
+        .then((json) => {
+          const ws = new WebSocket(json.data.url);
+          authWsRef.current = ws;
+          ws.onopen = () => resolve(ws);
+          ws.onerror = () => reject(new Error("Authenticated socket connection failed"));
+        })
+        .catch(reject);
+    });
+  }, [activeAccount]);
+
+  const fireTrade = useCallback(async () => {
+    if (!lastResult || firingTrade) return;
+    setFiringTrade(true);
+    setTradeStatus("Connecting to your account...");
+    try {
+      const ws = await openAuthenticatedSocket();
+      setTradeStatus(`Placing ${lastResult.contractType === "DIGITOVER" ? "Over" : "Under"} ${lastResult.barrier} on ${lastResult.market}...`);
+
+      const reqId = Math.floor(Math.random() * 1_000_000);
+      const buyResult = await new Promise<any>((resolve, reject) => {
+        const onMsg = (event: MessageEvent) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.req_id !== reqId) return;
+            ws.removeEventListener("message", onMsg);
+            if (data.error) reject(new Error(data.error.message || "Trade rejected"));
+            else resolve(data);
+          } catch {
+            /* ignore unrelated frames */
+          }
+        };
+        ws.addEventListener("message", onMsg);
+
+        ws.send(
+          JSON.stringify({
+            buy: 1,
+            price: Number(stake) || 1,
+            req_id: reqId,
+            parameters: {
+              amount: Number(stake) || 1,
+              basis: "stake",
+              contract_type: lastResult.contractType,
+              currency: activeAccount?.currency || "USD",
+              duration: Number(duration) || 1,
+              duration_unit: "t",
+              symbol: lastResult.symbol,
+              barrier: String(lastResult.barrier),
+            },
+          })
+        );
+      });
+
+      setTradeStatus(`✓ Trade placed — contract ${buyResult.buy?.contract_id}`);
+    } catch (err: any) {
+      setTradeStatus(`⚠ ${err.message || "Trade failed"}`);
+    } finally {
+      setFiringTrade(false);
+    }
+  }, [lastResult, firingTrade, openAuthenticatedSocket, stake, duration, activeAccount]);
 
   useEffect(() => {
     if (activeTab === "ov1un8") {
@@ -81,14 +182,20 @@ export default function AIScanner() {
 
       // Determine which trade type is better for this market
       let tradeT = "";
+      let contractType: "DIGITOVER" | "DIGITUNDER";
+      let barrier: number;
       if (ovPct >= unPct) {
+        contractType = "DIGITOVER";
+        barrier = ovThreshold;
         tradeT = isOv1 ? `Over 1 (${ovPct.toFixed(1)}%)` : `Over 2 (${ovPct.toFixed(1)}%)`;
       } else {
+        contractType = "DIGITUNDER";
+        barrier = unThreshold;
         tradeT = isOv1 ? `Under 8 (${unPct.toFixed(1)}%)` : `Under 7 (${unPct.toFixed(1)}%)`;
       }
 
       if (!best || score > best.score) {
-        best = { market: mkt.name, symbol: mkt.symbol, ovPct, unPct, score, tradeType: tradeT };
+        best = { market: mkt.name, symbol: mkt.symbol, ovPct, unPct, score, tradeType: tradeT, contractType, barrier };
       }
     }
 
@@ -109,6 +216,8 @@ export default function AIScanner() {
     setStatusText("Connecting to Deriv WebSocket...");
     setSelectedMarket("Scanning markets...");
     setTradeType("Scanning...");
+    setAwaitingConfirm(false);
+    setTradeStatus(null);
     resultsRef.current = {};
     pendingRef.current = new Set(MARKETS.map(m => m.symbol));
 
@@ -210,7 +319,7 @@ export default function AIScanner() {
       {open && (
         <div
           className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/60 backdrop-blur-sm p-0 md:p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setOpen(false); }}
+          onClick={(e) => { if (e.target === e.currentTarget) { setOpen(false); setAwaitingConfirm(false); } }}
         >
           <div className="bg-card w-full md:max-w-md rounded-t-2xl md:rounded-2xl shadow-2xl overflow-hidden max-h-[92vh] flex flex-col border border-border">
 
@@ -218,7 +327,7 @@ export default function AIScanner() {
             <div className="flex items-center justify-between px-5 py-4 border-b border-border bg-card shrink-0">
               <h2 className="text-base font-bold text-foreground">Entry Scanner</h2>
               <button
-                onClick={() => setOpen(false)}
+                onClick={() => { setOpen(false); setAwaitingConfirm(false); }}
                 className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-secondary rounded-lg transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -302,6 +411,24 @@ export default function AIScanner() {
               </div>
 
               <div className="px-4 space-y-4 pb-4">
+                {/* Trade parameters */}
+                <div className="grid grid-cols-2 gap-3">
+                  {[
+                    { label: "Stake (USD)", val: stake, set: setStake, id: "stake" },
+                    { label: "Duration (ticks)", val: duration, set: setDuration, id: "duration" },
+                  ].map(({ label, val, set, id }) => (
+                    <div key={id} className="space-y-1">
+                      <label className="text-xs text-muted-foreground font-medium">{label}</label>
+                      <input
+                        data-testid={`scanner-${id}`}
+                        value={val}
+                        onChange={e => set(e.target.value)}
+                        className="w-full h-9 bg-background border border-border rounded-lg px-2 text-sm text-foreground text-center font-mono focus:outline-none focus:border-primary"
+                      />
+                    </div>
+                  ))}
+                </div>
+
                 {/* Three inputs */}
                 <div className="grid grid-cols-3 gap-3">
                   {[
@@ -386,16 +513,63 @@ export default function AIScanner() {
 
                   <button
                     data-testid="scanner-load-scan"
-                    disabled={!lastResult}
-                    className={`h-11 rounded-xl font-bold text-sm border-2 transition-all ${
-                      lastResult
+                    onClick={() => setAwaitingConfirm(true)}
+                    disabled={!lastResult || firingTrade || awaitingConfirm}
+                    className={`h-11 rounded-xl font-bold text-sm border-2 transition-all flex items-center justify-center gap-2 ${
+                      lastResult && !firingTrade && !awaitingConfirm
                         ? "border-primary text-primary hover:bg-primary/10 active:scale-95"
                         : "border-border text-muted-foreground cursor-not-allowed"
                     }`}
                   >
-                    Load Scan
+                    {firingTrade ? (
+                      <>
+                        <span className="w-4 h-4 border-2 border-primary/40 border-t-primary rounded-full animate-spin" />
+                        Placing...
+                      </>
+                    ) : (
+                      "Load Scan"
+                    )}
                   </button>
                 </div>
+
+                {awaitingConfirm && lastResult && (
+                  <div
+                    data-testid="scanner-confirm-bar"
+                    className="rounded-xl border border-primary/40 bg-primary/5 p-3 space-y-2"
+                  >
+                    <p className="text-xs text-foreground font-medium">
+                      Confirm: {lastResult.contractType === "DIGITOVER" ? "Over" : "Under"} {lastResult.barrier} on {lastResult.market}, stake ${stake || "0"}, {duration || "0"} tick(s)?
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        data-testid="scanner-confirm-trade"
+                        onClick={() => {
+                          setAwaitingConfirm(false);
+                          fireTrade();
+                        }}
+                        className="h-9 rounded-lg bg-primary text-white text-sm font-bold hover:bg-primary/90 active:scale-95 transition-all"
+                      >
+                        Confirm Trade
+                      </button>
+                      <button
+                        data-testid="scanner-cancel-trade"
+                        onClick={() => setAwaitingConfirm(false)}
+                        className="h-9 rounded-lg border border-border text-muted-foreground text-sm font-bold hover:text-foreground transition-all"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {tradeStatus && (
+                  <div
+                    data-testid="scanner-trade-status"
+                    className={`text-xs px-1 pb-2 ${tradeStatus.startsWith("✓") ? "text-[#22C55E]" : tradeStatus.startsWith("⚠") ? "text-red-500" : "text-muted-foreground"}`}
+                  >
+                    {tradeStatus}
+                  </div>
+                )}
               </div>
             </div>
           </div>
