@@ -322,10 +322,21 @@ export default class ClientStore {
         const resolvedLoginId = loginid || this.loginid || getAccountId() || '';
         if (!resolvedLoginId) return 0;
 
-        const accountBalance =
-            this.accounts[resolvedLoginId]?.balance ??
-            (resolvedLoginId === this.loginid || resolvedLoginId === getAccountId() ? this.balance : undefined) ??
-            this.account_list.find(account => account.loginid === resolvedLoginId)?.balance;
+        const isActiveAccount = resolvedLoginId === this.loginid || resolvedLoginId === getAccountId();
+
+        // this.balance is written directly, synchronously, by the authorize/balance
+        // flow the moment a real server balance is confirmed for the active account
+        // (see api-base.ts authorizeAndSubscribe). this.accounts[loginid].balance
+        // is populated indirectly via setAccountList(), which can be fed a stale
+        // account list from an out-of-order concurrent authorizeAndSubscribe() call
+        // (e.g. one where the "all accounts" balance fetch failed and defaulted to
+        // 0). Because 0 is a defined value, `??` doesn't skip it, so a stale 0
+        // there would otherwise permanently mask a correct, freshly-synced balance.
+        // For the active account, trust this.balance first; only fall back to the
+        // accounts map for accounts other than the currently active one.
+        const accountBalance = isActiveAccount
+            ? (this.balance ?? this.accounts[resolvedLoginId]?.balance ?? this.account_list.find(account => account.loginid === resolvedLoginId)?.balance)
+            : (this.accounts[resolvedLoginId]?.balance ?? this.account_list.find(account => account.loginid === resolvedLoginId)?.balance);
 
         const numericBalance = Number(accountBalance ?? 0);
         return Number.isFinite(numericBalance) ? numericBalance : 0;

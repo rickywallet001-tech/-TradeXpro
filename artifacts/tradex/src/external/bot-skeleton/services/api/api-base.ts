@@ -73,6 +73,7 @@ class APIBase {
     active_symbols: any[] = [];
     current_auth_subscriptions: SubscriptionPromise[] = [];
     is_authorized = false;
+    private authorize_in_flight_promise: Promise<unknown> | null = null;
     balance: number | undefined;
     currency: string | undefined;
     loginid: string | undefined;
@@ -342,6 +343,24 @@ class APIBase {
     }
 
     async authorizeAndSubscribe() {
+        // Multiple call sites can trigger this concurrently (e.g. a page's own
+        // init effect and trade-purchase.ts's ensureAuthorizedForTrading()
+        // guard both firing around the same time). Two concurrent runs race
+        // their async balance/account-list fetches and can resolve out of
+        // order, letting a stale, partial result (e.g. a failed "all
+        // accounts" balance fetch defaulting to 0) clobber a correct one that
+        // already landed. Share a single in-flight promise so concurrent
+        // callers all await the same run instead of racing separate ones.
+        if (this.authorize_in_flight_promise) {
+            return this.authorize_in_flight_promise;
+        }
+        this.authorize_in_flight_promise = this._authorizeAndSubscribe().finally(() => {
+            this.authorize_in_flight_promise = null;
+        });
+        return this.authorize_in_flight_promise;
+    }
+
+    private async _authorizeAndSubscribe() {
         if (!this.api) return;
 
         this.account_id = getAccountId() || '';
