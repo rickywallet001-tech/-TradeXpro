@@ -8,6 +8,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/toaster";
 import Navbar from "@/components/Navbar";
 import AIScanner from "@/components/AIScanner";
+import SmartTraderAIChat from "@/components/SmartTraderAIChat";
 import RiskDisclaimer from "@/components/risk-disclaimer/risk-disclaimer";
 import LoadingScreen from "@/components/LoadingScreen";
 import BotBuilderFrame from "@/pages/BotBuilderFrame";
@@ -73,11 +74,13 @@ function AppContent() {
           <Route path="/strategies" element={<Strategies />} />
           <Route path="/copytrading" element={<CopyTrading />} />
           <Route path="/tradingview" element={<TradingView />} />
+          <Route path="/callback" element={<Callback />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </main>
       <AIScanner />
       <RiskDisclaimer />
+      {location.pathname === "/smarttrader" && <SmartTraderAIChat />}
     </div>
   );
 }
