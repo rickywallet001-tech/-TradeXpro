@@ -29,7 +29,7 @@ type MarketContext = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
 
 const SYSTEM_PROMPT = `You are Smart Trader, the trading copilot inside TradeX Pro.
@@ -56,9 +56,21 @@ function extractText(data: any): string {
   return parts.join("\n").trim();
 }
 
+function upstreamError(status: number, data: any): string {
+  const message = typeof data?.error?.message === "string" ? data.error.message.toLowerCase() : "";
+  if (status === 401) return "Smart Trader AI authentication failed. Check the OPENAI_API_KEY secret in Cloudflare Production.";
+  if (status === 403) return "Smart Trader AI access was denied. Check the OpenAI project permissions and model access.";
+  if (status === 404) return "Smart Trader AI model was not found. Check the OPENAI_MODEL setting in Cloudflare, or remove it to use the default model.";
+  if (status === 429) return message.includes("quota") || message.includes("billing")
+    ? "Smart Trader AI has reached the OpenAI API quota. Check your OpenAI billing and usage limits."
+    : "Smart Trader AI is rate-limited by OpenAI. Please try again in a moment.";
+  if (status >= 500) return "Smart Trader AI's provider is temporarily unavailable. Please try again shortly.";
+  return `Smart Trader AI request was rejected by the provider (HTTP ${status}).`;
+}
+
 export const onRequestPost: PagesFunction<Env> = async (context) => {
   if (!context.env.OPENAI_API_KEY) {
-    return json({ error: "Smart Trader AI is not configured. Add OPENAI_API_KEY to the Cloudflare Pages environment." }, 503);
+    return json({ error: "Smart Trader AI is not configured. Add OPENAI_API_KEY to the Cloudflare Pages Production environment." }, 503);
   }
 
   try {
@@ -82,13 +94,9 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       : [];
 
     const marketContext = body.marketContext ?? {};
-
     const contextMessage = `LIVE SMART TRADER CONTEXT (observational data only):\n${JSON.stringify(marketContext)}`;
-
-    const input = [
-      ...history,
-      { role: "user", content: `${question}\n\n${contextMessage}` },
-    ];
+    const input = [...history, { role: "user", content: `${question}\n\n${contextMessage}` }];
+    const model = context.env.OPENAI_MODEL || "gpt-5-mini";
 
     const upstream = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -97,18 +105,23 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: context.env.OPENAI_MODEL || "gpt-5-mini",
+        model,
         instructions: SYSTEM_PROMPT,
         input,
         max_output_tokens: 500,
+        store: false,
       }),
     });
 
     const data = await upstream.json().catch(() => ({}));
     if (!upstream.ok) {
-      const detail = typeof data?.error?.message === "string" ? data.error.message : "OpenAI request failed.";
-      console.error("Smart Trader AI upstream error:", detail);
-      return json({ error: "Smart Trader AI is temporarily unavailable." }, 502);
+      console.error("Smart Trader AI upstream error", {
+        status: upstream.status,
+        model,
+        requestId: upstream.headers.get("x-request-id"),
+        error: data?.error?.message,
+      });
+      return json({ error: upstreamError(upstream.status, data) }, 502);
     }
 
     const answer = extractText(data);
